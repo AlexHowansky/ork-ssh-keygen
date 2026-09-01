@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ssh-key = { version = "^0.6", features = ["ed25519", "rand_core"] }
+ssh-key = { version = "^0.6", features = ["ed25519", "p256", "rand_core"] }
 rand = "^0.8"
 regex = "^1"
 base64ct = "^1.8"
