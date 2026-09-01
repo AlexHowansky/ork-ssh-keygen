@@ -5,9 +5,36 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+const USAGE: &str = "Usage: ork-ssh-keygen [-t ed25519|ecdsa] [-j N] <regex>";
+
 fn usage() -> ! {
-    eprintln!("Usage: ork-ssh-keygen [-t ed25519|ecdsa] <regex> [threads]");
+    eprintln!("{}", USAGE);
     std::process::exit(1);
+}
+
+fn help() -> ! {
+    println!(
+        "ork-ssh-keygen \u{2014} vanity SSH key generator
+
+{}
+
+Brute-forces SSH key pairs until the base64 body of the public key
+matches <regex>.
+
+Options:
+  -t, --type <TYPE>   Key type: ed25519 (default) or ecdsa (NIST P-256)
+  -j, --threads <N>   Worker threads (default: 75% of available cores)
+  -h, --help          Show this help
+
+Output is written to id_ed25519 / id_ed25519.pub, or id_ecdsa /
+id_ecdsa.pub for -t ecdsa, in the current directory.
+
+Examples:
+  ork-ssh-keygen 'cafe'
+  ork-ssh-keygen -t ecdsa -j 8 'AAAA.*d00d$'",
+        USAGE
+    );
+    std::process::exit(0);
 }
 
 /// Maps a `-t` value to its algorithm and the base filename used for output.
@@ -26,6 +53,7 @@ fn key_type(name: &str) -> Option<(Algorithm, &'static str)> {
 
 fn main() {
     let mut type_arg: Option<String> = None;
+    let mut threads_arg: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut args = env::args().skip(1);
 
@@ -40,6 +68,18 @@ fn main() {
                     usage();
                 }
             }
+        } else if let Some(value) = arg.strip_prefix("--threads=") {
+            threads_arg = Some(value.to_string());
+        } else if arg == "-j" || arg == "--threads" {
+            match args.next() {
+                Some(value) => threads_arg = Some(value),
+                None => {
+                    eprintln!("Missing value for {}", arg);
+                    usage();
+                }
+            }
+        } else if arg == "-h" || arg == "--help" {
+            help();
         } else if arg.starts_with('-') && arg != "-" {
             eprintln!("Unknown option: {}", arg);
             usage();
@@ -61,19 +101,26 @@ fn main() {
         Some(pattern) => pattern,
         None => usage(),
     };
+    if positional.next().is_some() {
+        eprintln!("Too many arguments");
+        usage();
+    }
+
     let default_threads = (thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8)
         * 3)
         / 4;
-    let num_threads: usize = positional
-        .next()
-        .map(|s| s.parse().expect("threads must be a number"))
-        .unwrap_or(default_threads.max(1));
-    if positional.next().is_some() {
-        eprintln!("Too many arguments");
-        usage();
-    }
+    let num_threads: usize = match threads_arg {
+        Some(value) => match value.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("thread count must be a positive number, got: {}", value);
+                usage();
+            }
+        },
+        None => default_threads.max(1),
+    };
 
     eprintln!("Using {} threads", num_threads);
 
