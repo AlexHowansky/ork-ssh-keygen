@@ -1,9 +1,40 @@
+use base64ct::{Base64, Encoding};
+use ed25519_dalek::SigningKey;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::{ProjectivePoint, Scalar};
+use rand::RngCore;
 use regex::Regex;
+use ssh_key::private::{EcdsaKeypair, Ed25519Keypair};
 use ssh_key::{Algorithm, EcdsaCurve, LineEnding, PrivateKey};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+
+/// Fixed header of an `ssh-ed25519` public key blob: `u32(11) "ssh-ed25519" u32(32)`.
+/// The 32-byte key follows, for 51 bytes total (a clean multiple of 3, so the base64
+/// is exactly 68 chars with no padding).
+const ED_PREFIX: &[u8] = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20";
+const ED_BLOB: usize = 51;
+const ED_B64: usize = 68;
+/// Last 3-byte-aligned offset at or below `ED_PREFIX.len()` (19). Everything before it
+/// is constant, so each candidate only re-encodes `blob[18..]` into `b64[24..]`.
+const ED_FROM: usize = 18;
+
+/// Fixed header of an `ecdsa-sha2-nistp256` blob: `u32(19) "ecdsa-sha2-nistp256"
+/// u32(8) "nistp256" u32(65)`. The 65-byte SEC1 point follows, for 104 bytes total.
+const EC_PREFIX: &[u8] =
+    b"\x00\x00\x00\x13ecdsa-sha2-nistp256\x00\x00\x00\x08nistp256\x00\x00\x00\x41";
+const EC_BLOB: usize = 104;
+const EC_B64: usize = 140;
+/// 39 is already 3-byte aligned, so the point starts exactly at base64 char 52.
+const EC_FROM: usize = 39;
+
+/// Keys between progress reports, per thread.
+const REPORT_EVERY: u64 = 100_000;
+
+/// Steps before the ECDSA walk picks a fresh random starting scalar.
+const EC_RESEED_EVERY: u64 = 4_000_000;
 
 const USAGE: &str = "Usage: ork-ssh-keygen [-t ed25519|ecdsa] [-j N] <regex>";
 
@@ -48,6 +79,132 @@ fn key_type(name: &str) -> Option<(Algorithm, &'static str)> {
             "id_ecdsa",
         )),
         _ => None,
+    }
+}
+
+/// Progress bookkeeping shared with the other worker threads.
+struct Progress<'a> {
+    found: &'a AtomicBool,
+    total: &'a AtomicU64,
+    count: u64,
+    reported: u64,
+}
+
+impl Progress<'_> {
+    /// Records `n` more candidates, flushing to the shared counter every
+    /// `REPORT_EVERY`. A threshold rather than an exact multiple, since the ECDSA
+    /// walk advances the count a whole batch at a time.
+    fn tick(&mut self, n: u64) {
+        self.count += n;
+        let delta = self.count - self.reported;
+        if delta >= REPORT_EVERY {
+            self.reported = self.count;
+            eprintln!("{}", self.total.fetch_add(delta, Ordering::Relaxed) + delta);
+        }
+    }
+
+    /// Flushes the not-yet-reported remainder and returns the global total.
+    fn finish(&self) -> u64 {
+        let delta = self.count - self.reported;
+        self.total.fetch_add(delta, Ordering::Relaxed) + delta
+    }
+}
+
+/// Base64 is ASCII by construction, so this never fails.
+fn as_str(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).expect("base64 output is valid ASCII")
+}
+
+/// Ed25519 search. Every candidate costs a full SHA-512 plus a fixed-base scalar
+/// multiplication: the OpenSSH format stores the 32-byte *seed* and derives the
+/// signing scalar as SHA-512(seed), so there is no way to walk the scalar
+/// incrementally and still have a seed to write out.
+fn search_ed25519(re: &Regex, progress: &mut Progress) -> Option<PrivateKey> {
+    let mut rng = rand::thread_rng();
+    let mut seed = [0u8; 32];
+
+    let mut blob = [0u8; ED_BLOB];
+    blob[..ED_PREFIX.len()].copy_from_slice(ED_PREFIX);
+    let mut b64 = [0u8; ED_B64];
+    Base64::encode(&blob, &mut b64).expect("base64 buffer sized for blob");
+
+    loop {
+        if progress.found.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        rng.fill_bytes(&mut seed);
+        let verifying = SigningKey::from_bytes(&seed).verifying_key();
+        blob[ED_PREFIX.len()..].copy_from_slice(verifying.as_bytes());
+        // Only the tail changed; chars before ED_FROM * 4 / 3 are fixed by the prefix.
+        Base64::encode(&blob[ED_FROM..], &mut b64[ED_FROM * 4 / 3..])
+            .expect("base64 buffer sized for tail");
+
+        progress.tick(1);
+        if re.is_match(as_str(&b64)) {
+            return Some(Ed25519Keypair::from_seed(&seed).into());
+        }
+    }
+}
+
+/// ECDSA P-256 search. Unlike Ed25519 the OpenSSH format stores the private scalar
+/// directly, so consecutive candidates can be walked as d+1 / P+G — one point
+/// addition plus one affine conversion each, instead of a full scalar multiplication.
+fn search_ecdsa(re: &Regex, progress: &mut Progress) -> Option<PrivateKey> {
+    let mut rng = rand::thread_rng();
+
+    let mut blob = [0u8; EC_BLOB];
+    blob[..EC_PREFIX.len()].copy_from_slice(EC_PREFIX);
+    let mut b64 = [0u8; EC_B64];
+    Base64::encode(&blob, &mut b64).expect("base64 buffer sized for blob");
+
+    let generator = ProjectivePoint::GENERATOR;
+    let mut scalar = *p256::NonZeroScalar::random(&mut rng).as_ref();
+    let mut point = generator * scalar;
+    let mut since_reseed = 0u64;
+
+    loop {
+        if progress.found.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        // Restart from a fresh random scalar periodically, so a run of related keys
+        // stays short and the walk can never approach the group order.
+        if since_reseed >= EC_RESEED_EVERY {
+            scalar = *p256::NonZeroScalar::random(&mut rng).as_ref();
+            point = generator * scalar;
+            since_reseed = 0;
+        }
+
+        let affine: p256::AffinePoint = point.to_affine();
+        let encoded = affine.to_encoded_point(false);
+        let bytes = encoded.as_bytes();
+        progress.tick(1);
+        since_reseed += 1;
+
+        if bytes.len() == EC_BLOB - EC_PREFIX.len() {
+            blob[EC_PREFIX.len()..].copy_from_slice(bytes);
+            // Only the tail changed; chars before EC_FROM * 4 / 3 are fixed by the prefix.
+            Base64::encode(&blob[EC_FROM..], &mut b64[EC_FROM * 4 / 3..])
+                .expect("base64 buffer sized for tail");
+
+            if re.is_match(as_str(&b64)) {
+                // from_bytes rejects zero and anything >= the group order, which is
+                // the range check skipped by building the key from a raw scalar.
+                let secret = p256::SecretKey::from_bytes(&scalar.to_bytes())
+                    .expect("walked scalar is a valid P-256 private key");
+                return Some(
+                    EcdsaKeypair::NistP256 {
+                        public: encoded,
+                        private: secret.into(),
+                    }
+                    .into(),
+                );
+            }
+        }
+
+        scalar += Scalar::ONE;
+        point += generator;
     }
 }
 
@@ -142,37 +299,22 @@ fn main() {
 
             thread::spawn(move || {
                 let re = Regex::new(&pattern).unwrap();
-                let mut rng = rand::thread_rng();
-                let mut local_count: u64 = 0;
+                let mut progress = Progress {
+                    found: &found,
+                    total: &total_count,
+                    count: 0,
+                    reported: 0,
+                };
 
-                loop {
-                    if found.load(Ordering::Relaxed) {
-                        return None;
-                    }
+                let key = match algorithm {
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP256,
+                    } => search_ecdsa(&re, &mut progress),
+                    _ => search_ed25519(&re, &mut progress),
+                }?;
 
-                    local_count += 1;
-                    let key = PrivateKey::random(&mut rng, algorithm.clone())
-                        .expect("failed to generate key");
-                    let public_openssh = key
-                        .public_key()
-                        .to_openssh()
-                        .expect("failed to serialize public key");
-                    let base64_part = public_openssh
-                        .split_whitespace()
-                        .nth(1)
-                        .expect("invalid OpenSSH public key format");
-
-                    if re.is_match(base64_part) {
-                        found.store(true, Ordering::Relaxed);
-                        let total = total_count.fetch_add(local_count, Ordering::Relaxed) + local_count;
-                        return Some((key, total));
-                    }
-
-                    if local_count % 100000 == 0 {
-                        let total = total_count.fetch_add(100000, Ordering::Relaxed) + 100000;
-                        eprintln!("{}", total);
-                    }
-                }
+                found.store(true, Ordering::Relaxed);
+                Some((key, progress.finish()))
             })
         })
         .collect();

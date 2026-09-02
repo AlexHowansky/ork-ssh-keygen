@@ -6,5 +6,7 @@ edition = "2021"
 [dependencies]
 ssh-key = { version = "^0.6", features = ["ed25519", "p256", "rand_core"] }
 rand = "^0.8"
+ed25519-dalek = "^2.2"
+p256 = { version = "^0.13", default-features = false, features = ["arithmetic"] }
 regex = "^1"
 base64ct = "^1.8"
