@@ -58,6 +58,24 @@ The matching public key and total number of keys tested are printed to stdout. P
 
 Requires [Rust](https://www.rust-lang.org/tools/install).
 
+```
+make build
+```
+
+This builds a native binary at `target/release/ork-ssh-keygen` and, if the MinGW
+toolchain is available, cross-compiles a Windows binary at
+`target/x86_64-pc-windows-gnu/release/ork-ssh-keygen.exe`. If MinGW is missing, the
+Windows build is skipped with a warning and the native build still succeeds.
+
+To enable the Windows build on Debian/Ubuntu:
+
+```
+sudo apt install gcc-mingw-w64-x86-64
+rustup target add x86_64-pc-windows-gnu
+```
+
+Use `make linux` or `make windows` to build just one.
+
 ## How it works
 
 Each thread independently generates random Ed25519 key pairs using a thread-local CSPRNG, serializes the public key to OpenSSH format, and tests it against the compiled regex. When a match is found, an `AtomicBool` flag signals all other threads to stop. Thread-local counters are periodically flushed to a shared atomic to minimize contention while still reporting progress.

@@ -15,7 +15,19 @@ Supported key types (`-t`): `ed25519` (default) and `ecdsa` (NIST P-256).
 - **Build:** `cargo build --release` (release mode important for performance)
 - **Run:** `cargo run --release -- [-t ed25519|ecdsa] [-j N] '<regex>'`
 - **Check:** `cargo check`
-- **Make targets:** `make build`, `make check`, `make clean`, `make run ARGS="[-t ecdsa] [-j N] '<regex>'"`
+- **Make targets:** `make build`, `make linux`, `make windows`, `make check`, `make clean`, `make run ARGS="[-t ecdsa] [-j N] '<regex>'"`
+
+`make build` builds both the native and the Windows binary:
+
+- Native: `target/release/ork-ssh-keygen`
+- Windows: `target/x86_64-pc-windows-gnu/release/ork-ssh-keygen.exe`
+
+The Windows build is best-effort — it requires the MinGW linker
+(`sudo apt install gcc-mingw-w64-x86-64`) plus `rustup target add x86_64-pc-windows-gnu`.
+If `x86_64-w64-mingw32-gcc` isn't on `PATH`, the `windows` target prints a warning and
+exits 0 so the native build still succeeds. The linker is pinned in `.cargo/config.toml`.
+All dependencies are pure Rust with no C build scripts, so no other cross-compilation
+setup is needed.
 
 ## Architecture
 
