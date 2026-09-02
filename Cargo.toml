@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ssh-key = { version = "^0.6", features = ["ed25519", "p256", "rand_core"] }
-rand = "^0.8"
+ssh-key = { version = "^0.6.7", features = ["ed25519", "p256", "rand_core"] }
+regex = "^1.13"
+base64ct = "^1.8.3"
+
+# The next three are held back by ssh-key 0.6.x, which depends on
+# ed25519-dalek ^2, p256 ^0.13 and rand_core ^0.6. main.rs uses those types
+# directly in the hot loops, so they must unify with ssh-key's copies.
+# Bumping to ed25519-dalek 3.0 / p256 0.14 / rand 0.10 requires ssh-key 0.7,
+# which is still a release candidate (0.7.0-rc.11). Check with `cargo tree -d`.
 ed25519-dalek = "^2.2"
-p256 = { version = "^0.13", default-features = false, features = ["arithmetic"] }
-regex = "^1"
-base64ct = "^1.8"
+p256 = { version = "^0.13.2", default-features = false, features = ["arithmetic"] }
+rand = "^0.8.8"
