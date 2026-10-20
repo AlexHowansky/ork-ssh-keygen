@@ -7,6 +7,9 @@ use regex::Regex;
 use ssh_key::private::{EcdsaKeypair, Ed25519Keypair};
 use ssh_key::{Algorithm, EcdsaCurve, LineEnding, PrivateKey};
 use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -36,7 +39,7 @@ const REPORT_EVERY: u64 = 100_000;
 /// Steps before the ECDSA walk picks a fresh random starting scalar.
 const EC_RESEED_EVERY: u64 = 4_000_000;
 
-const USAGE: &str = "Usage: ork-ssh-keygen [-t ed25519|ecdsa] [-j N] <regex>";
+const USAGE: &str = "Usage: ork-ssh-keygen [-t ed25519|ecdsa] [-j N] [--overwrite] <regex>";
 
 fn usage() -> ! {
     eprintln!("{}", USAGE);
@@ -55,10 +58,12 @@ matches <regex>.
 Options:
   -t, --type <TYPE>   Key type: ed25519 (default) or ecdsa (NIST P-256)
   -j, --threads <N>   Worker threads (default: 75% of available cores)
+      --overwrite     Replace existing output files instead of refusing
   -h, --help          Show this help
 
 Output is written to id_ed25519 / id_ed25519.pub, or id_ecdsa /
-id_ecdsa.pub for -t ecdsa, in the current directory.
+id_ecdsa.pub for -t ecdsa, in the current directory. Existing files are left alone
+and the run is refused unless --overwrite is given.
 
 Examples:
   ork-ssh-keygen 'cafe'
@@ -80,6 +85,20 @@ fn key_type(name: &str) -> Option<(Algorithm, &'static str)> {
         )),
         _ => None,
     }
+}
+
+/// Writes `data` to `path`. Without `overwrite` the file must not already exist;
+/// `create_new` makes that check atomic with the open, so a file that appears
+/// mid-search is still never clobbered.
+fn write_key(path: &str, data: &[u8], overwrite: bool) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    options.open(path)?.write_all(data)
 }
 
 /// Progress bookkeeping shared with the other worker threads.
@@ -211,6 +230,7 @@ fn search_ecdsa(re: &Regex, progress: &mut Progress) -> Option<PrivateKey> {
 fn main() {
     let mut type_arg: Option<String> = None;
     let mut threads_arg: Option<String> = None;
+    let mut overwrite = false;
     let mut positional: Vec<String> = Vec::new();
     let mut args = env::args().skip(1);
 
@@ -235,6 +255,8 @@ fn main() {
                     usage();
                 }
             }
+        } else if arg == "--overwrite" {
+            overwrite = true;
         } else if arg == "-h" || arg == "--help" {
             help();
         } else if arg.starts_with('-') && arg != "-" {
@@ -278,6 +300,18 @@ fn main() {
         },
         None => default_threads.max(1),
     };
+
+    let pub_name = format!("{}.pub", key_name);
+
+    // Refuse up front rather than after a search that may take hours.
+    if !overwrite {
+        for path in [key_name, pub_name.as_str()] {
+            if Path::new(path).exists() {
+                eprintln!("{} already exists; use --overwrite to replace it", path);
+                std::process::exit(1);
+            }
+        }
+    }
 
     eprintln!("Using {} threads", num_threads);
 
@@ -329,13 +363,18 @@ fn main() {
                 .to_openssh()
                 .expect("failed to serialize public key");
 
-            std::fs::write(key_name, private_openssh.as_bytes())
-                .expect("failed to write private key");
-            std::fs::write(format!("{}.pub", key_name), public_openssh.as_bytes())
-                .expect("failed to write public key");
-
             println!("Found after {} keys", total);
             println!("{}", public_openssh);
+
+            for (path, data) in [
+                (key_name, private_openssh.as_bytes()),
+                (pub_name.as_str(), public_openssh.as_bytes()),
+            ] {
+                if let Err(e) = write_key(path, data, overwrite) {
+                    eprintln!("failed to write {}: {}", path, e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
