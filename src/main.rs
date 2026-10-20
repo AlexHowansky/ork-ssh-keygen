@@ -89,8 +89,10 @@ fn key_type(name: &str) -> Option<(Algorithm, &'static str)> {
 
 /// Writes `data` to `path`. Without `overwrite` the file must not already exist;
 /// `create_new` makes that check atomic with the open, so a file that appears
-/// mid-search is still never clobbered.
-fn write_key(path: &str, data: &[u8], overwrite: bool) -> std::io::Result<()> {
+/// mid-search is still never clobbered. On Unix the file gets `mode`; it is
+/// ignored elsewhere.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn write_key(path: &str, data: &[u8], mode: u32, overwrite: bool) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true);
     if overwrite {
@@ -98,7 +100,14 @@ fn write_key(path: &str, data: &[u8], overwrite: bool) -> std::io::Result<()> {
     } else {
         options.create_new(true);
     }
-    options.open(path)?.write_all(data)
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    let mut file = options.open(path)?;
+    // `mode` only applies on creation; an overwritten file keeps its old
+    // permissions, so set them before any key material is written.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+    file.write_all(data)
 }
 
 /// Progress bookkeeping shared with the other worker threads.
@@ -366,11 +375,11 @@ fn main() {
             println!("Found after {} keys", total);
             println!("{}", public_openssh);
 
-            for (path, data) in [
-                (key_name, private_openssh.as_bytes()),
-                (pub_name.as_str(), public_openssh.as_bytes()),
+            for (path, data, mode) in [
+                (key_name, private_openssh.as_bytes(), 0o600),
+                (pub_name.as_str(), public_openssh.as_bytes(), 0o644),
             ] {
-                if let Err(e) = write_key(path, data, overwrite) {
+                if let Err(e) = write_key(path, data, mode, overwrite) {
                     eprintln!("failed to write {}: {}", path, e);
                     std::process::exit(1);
                 }
